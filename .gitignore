@@ -2,7 +2,9 @@
 /.build
 /.build-release
 /.build-test
-/dist
+/dist/*
+!/dist/AutoLockMyMac.app/
+!/dist/AutoLockMyMac.app/**
 /Packages
 xcuserdata/
 DerivedData/
