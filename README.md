@@ -1,4 +1,4 @@
-# AutoLockMyMac
+# AutoLockMyMac - BLE Device & Apple Watch
 
 一个 macOS 菜单栏应用：根据已配对蓝牙设备的 RSSI 判断设备是否还在电脑附近，离开后执行显示器休眠或启动屏保。
 
