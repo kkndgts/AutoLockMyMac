@@ -36,6 +36,7 @@ struct MainView: View {
 
                 HStack(spacing: 24) {
                     infoBlock(title: "监控", value: model.settings.isMonitoringEnabled ? "开启" : "关闭")
+                    infoBlock(title: "扫描间隔", value: model.sampleIntervalDescription)
                     infoBlock(title: "门限", value: model.thresholdDescription)
                     infoBlock(title: "离开判定", value: model.awaySamplesDescription)
                     infoBlock(title: "RSSI", value: model.latestRSSI.map { "\($0) dBm" } ?? "--")
@@ -177,20 +178,68 @@ struct MainView: View {
 
                 VStack(alignment: .leading, spacing: 10) {
                     HStack {
+                        Text("扫描间隔")
+                        Spacer()
+                        Text(model.sampleIntervalDescription)
+                            .foregroundStyle(.secondary)
+                    }
+
+                    HStack {
+                        Stepper(
+                            "每隔多少秒采样一次",
+                            value: Binding(
+                                get: { Int(model.settings.effectiveSampleInterval.rounded()) },
+                                set: { model.setSampleInterval(Double($0)) }
+                            ),
+                            in: Int(AppSettings.minimumSampleInterval) ... Int(AppSettings.maximumSampleInterval),
+                            step: 5
+                        )
+                        Spacer()
+                        TextField(
+                            "秒",
+                            value: Binding(
+                                get: { Int(model.settings.effectiveSampleInterval.rounded()) },
+                                set: { model.setSampleInterval(Double($0)) }
+                            ),
+                            format: .number
+                        )
+                        .textFieldStyle(.roundedBorder)
+                        .frame(width: 84)
+                    }
+
+                    Text("范围 15～600 秒。间隔越长越省电，但离开后的响应会更慢。")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                VStack(alignment: .leading, spacing: 10) {
+                    HStack {
                         Text("连续低于门限多少次才算离开")
                         Spacer()
                         Text(model.awaySamplesDescription)
                             .foregroundStyle(.secondary)
                     }
 
-                    Stepper(
-                        value: Binding(
-                            get: { model.settings.effectiveAwaySampleCount },
-                            set: { model.setSpecificAwaySampleCount($0) }
-                        ),
-                        in: 1 ... 10
-                    ) {
-                        Text("连续样本数")
+                    HStack {
+                        Stepper(
+                            "连续样本数",
+                            value: Binding(
+                                get: { model.settings.effectiveAwaySampleCount },
+                                set: { model.setSpecificAwaySampleCount($0) }
+                            ),
+                            in: 1 ... 10
+                        )
+                        Spacer()
+                        TextField(
+                            "次数",
+                            value: Binding(
+                                get: { model.settings.effectiveAwaySampleCount },
+                                set: { model.setSpecificAwaySampleCount(min(10, max(1, $0))) }
+                            ),
+                            format: .number
+                        )
+                        .textFieldStyle(.roundedBorder)
+                        .frame(width: 84)
                     }
                 }
             }

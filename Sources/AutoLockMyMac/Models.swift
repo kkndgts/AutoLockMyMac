@@ -143,6 +143,9 @@ enum BluetoothAvailability {
 }
 
 struct AppSettings: Codable, Equatable {
+    static let minimumSampleInterval: Double = 15
+    static let maximumSampleInterval: Double = 600
+
     var selectedDeviceIdentifier: String?
     var sensitivityPreset: SensitivityPreset
     var customThreshold: Double
@@ -158,7 +161,7 @@ struct AppSettings: Codable, Equatable {
         customAwaySampleCount: 3,
         lockAction: .displaySleep,
         isMonitoringEnabled: false,
-        sampleInterval: 5
+        sampleInterval: 15
     )
 
     var effectiveThreshold: Int {
@@ -177,5 +180,9 @@ struct AppSettings: Codable, Equatable {
         default:
             sensitivityPreset.awaySampleCount
         }
+    }
+
+    var effectiveSampleInterval: Double {
+        min(Self.maximumSampleInterval, max(Self.minimumSampleInterval, sampleInterval))
     }
 }

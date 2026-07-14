@@ -12,15 +12,17 @@ private struct UncheckedSendableBox<Value>: @unchecked Sendable {
 @MainActor
 final class BluetoothDeviceProvider: NSObject {
     var onAvailabilityChange: ((BluetoothAvailability) -> Void)?
+    var onDevicesChange: (() -> Void)?
     private(set) var availability: BluetoothAvailability = .unknown
 
     private var central: CBCentralManager!
     private var discovered: [UUID: DiscoveredDevice] = [:]
     private var peripherals: [UUID: CBPeripheral] = [:]
-    private var loggedIdentifiers: Set<UUID> = []
 
     private var monitoredIdentifier: UUID?
     private var monitoredPeripheral: CBPeripheral?
+    private var scanMode: ScanMode = .idle
+    private var discoveryStopWorkItem: DispatchWorkItem?
 
     override init() {
         super.init()
@@ -139,25 +141,86 @@ final class BluetoothDeviceProvider: NSObject {
         if peripheral.state == .connected {
             peripheral.readRSSI()
         } else {
+            ensureMonitoringScanActive()
             connectMonitoredIfNeeded()
         }
     }
 
-    func startScanning() {
-        guard central.state == .poweredOn, central.isScanning == false else {
+    func refreshDiscovery(duration: TimeInterval = 8) {
+        guard central.state == .poweredOn else {
+            return
+        }
+        startScanning(mode: .discovery)
+
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            if self.scanMode == .discovery {
+                self.stopScanning()
+            }
+        }
+        discoveryStopWorkItem?.cancel()
+        discoveryStopWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + duration, execute: workItem)
+    }
+
+    func startMonitoring() {
+        ensureMonitoringScanActive()
+        connectMonitoredIfNeeded()
+    }
+
+    func stopMonitoring() {
+        stopScanning()
+        if let peripheral = monitoredPeripheral, peripheral.state != .disconnected {
+            central.cancelPeripheralConnection(peripheral)
+        }
+    }
+
+    private func startScanning(mode: ScanMode) {
+        guard central.state == .poweredOn else {
+            return
+        }
+
+        discoveryStopWorkItem?.cancel()
+        discoveryStopWorkItem = nil
+
+        if central.isScanning {
+            if scanMode == mode {
+                return
+            }
+            central.stopScan()
+        }
+
+        scanMode = mode
+        guard central.isScanning == false else {
             return
         }
         central.scanForPeripherals(
             withServices: nil,
-            options: [CBCentralManagerScanOptionAllowDuplicatesKey: true]
+            options: [CBCentralManagerScanOptionAllowDuplicatesKey: false]
         )
-        log("开始扫描 BLE 广播…")
+        log("开始扫描 BLE 广播（\(mode.description)）…")
+    }
+
+    private func ensureMonitoringScanActive() {
+        guard monitoredIdentifier != nil else {
+            return
+        }
+
+        if monitoredPeripheral?.state == .connected {
+            stopScanning()
+            return
+        }
+
+        startScanning(mode: .monitoring)
     }
 
     func stopScanning() {
+        discoveryStopWorkItem?.cancel()
+        discoveryStopWorkItem = nil
         if central.isScanning {
             central.stopScan()
         }
+        scanMode = .idle
     }
 
     private func connectMonitoredIfNeeded() {
@@ -166,10 +229,12 @@ final class BluetoothDeviceProvider: NSObject {
         }
         switch peripheral.state {
         case .connected:
+            stopScanning()
             peripheral.readRSSI()
         case .connecting:
             break
         default:
+            ensureMonitoringScanActive()
             log("尝试连接被监控设备 \(peripheral.identifier.uuidString.prefix(8))…")
             central.connect(peripheral, options: nil)
         }
@@ -209,6 +274,7 @@ final class BluetoothDeviceProvider: NSObject {
             isApple: isApple ?? existing?.isApple ?? false,
             isConnectable: isConnectable ?? existing?.isConnectable ?? false
         )
+        onDevicesChange?()
     }
 
     private func log(_ message: String) {
@@ -234,6 +300,20 @@ final class BluetoothDeviceProvider: NSObject {
         var isApple: Bool
         var isConnectable: Bool
     }
+
+    private enum ScanMode: Equatable {
+        case idle
+        case discovery
+        case monitoring
+
+        var description: String {
+            switch self {
+            case .idle: "空闲"
+            case .discovery: "发现设备"
+            case .monitoring: "监控设备"
+            }
+        }
+    }
 }
 
 extension BluetoothDeviceProvider: CBCentralManagerDelegate {
@@ -244,8 +324,6 @@ extension BluetoothDeviceProvider: CBCentralManagerDelegate {
             switch state {
             case .poweredOn:
                 availability = .ready
-                startScanning()
-                connectMonitoredIfNeeded()
             case .poweredOff:
                 availability = .poweredOff
             case .unauthorized:
@@ -275,27 +353,17 @@ extension BluetoothDeviceProvider: CBCentralManagerDelegate {
 
         // 解析广播包：厂商标识（Apple = 0x004C）、是否可连接、服务 UUID。
         let manufacturerData = advertisementData[CBAdvertisementDataManufacturerDataKey] as? Data
-        let companyID: Int? = manufacturerData.flatMap { data in
+        let companyID = manufacturerData.flatMap { data in
             data.count >= 2 ? Int(data[0]) | (Int(data[1]) << 8) : nil
         }
         let isApple = companyID == 0x004C
         let isConnectable = (advertisementData[CBAdvertisementDataIsConnectable] as? NSNumber)?.boolValue ?? false
-        let serviceUUIDs = (advertisementData[CBAdvertisementDataServiceUUIDsKey] as? [CBUUID])?
-            .map { $0.uuidString }
-            .joined(separator: ",") ?? "无"
 
         let box = UncheckedSendableBox(value: peripheral)
 
         MainActor.assumeIsolated {
             let peripheral = box.value
             peripherals[identifier] = peripheral
-
-            if loggedIdentifiers.contains(identifier) == false {
-                loggedIdentifiers.insert(identifier)
-                let displayName = resolvedName ?? "(无名)"
-                let companyText = companyID.map { String(format: "0x%04X", $0) } ?? "无"
-                log("发现设备 \(displayName) | UUID=\(identifier.uuidString) | RSSI=\(rssiValue) | Apple=\(isApple) | 厂商=\(companyText) | 可连接=\(isConnectable) | 服务=\(serviceUUIDs)")
-            }
 
             // RSSI == 127 表示广播包里没有有效的信号强度读数，但设备仍可被连接读取。
             if rssiValue != 127 {
@@ -324,6 +392,7 @@ extension BluetoothDeviceProvider: CBCentralManagerDelegate {
             let peripheral = box.value
             log("已连接 \(shortID)，开始读取 RSSI")
             peripheral.delegate = self
+            stopScanning()
             peripheral.readRSSI()
         }
     }
@@ -352,6 +421,7 @@ extension BluetoothDeviceProvider: CBCentralManagerDelegate {
             log("断开 \(shortID)：\(reason)")
             if identifier == monitoredIdentifier {
                 // 设备走远或休眠会导致断开，尝试重新连接以便它回到附近时继续读 RSSI。
+                ensureMonitoringScanActive()
                 connectMonitoredIfNeeded()
             }
         }
@@ -377,7 +447,6 @@ extension BluetoothDeviceProvider: CBPeripheralDelegate {
             guard rssiValue != 127 else {
                 return
             }
-            log("readRSSI \(identifier.uuidString.prefix(8)) = \(rssiValue) dBm")
             record(identifier: identifier, name: name, rssi: rssiValue)
         }
     }

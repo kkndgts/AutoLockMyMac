@@ -23,13 +23,16 @@ final class AppModel: ObservableObject {
     private var timer: Timer?
     private var wakeTask: Task<Void, Never>?
     private var cancellables = Set<AnyCancellable>()
+    private var samplingMode: SamplingMode = .normal
 
     init() {
         let storedData = UserDefaults.standard.data(forKey: settingsKey)
             ?? UserDefaults.standard.data(forKey: legacySettingsKey)
         if let data = storedData,
            let loaded = try? JSONDecoder().decode(AppSettings.self, from: data) {
-            settings = loaded
+            var normalized = loaded
+            normalized.sampleInterval = loaded.effectiveSampleInterval
+            settings = normalized
         } else {
             settings = .default
         }
@@ -38,6 +41,9 @@ final class AppModel: ObservableObject {
 
         provider.onAvailabilityChange = { [weak self] availability in
             self?.handleAvailabilityChange(availability)
+        }
+        provider.onDevicesChange = { [weak self] in
+            self?.discoveredDevices = self?.provider.loadDiscoveredDevices() ?? []
         }
 
         refreshDevices()
@@ -59,6 +65,10 @@ final class AppModel: ObservableObject {
         "\(settings.effectiveThreshold) dBm"
     }
 
+    var sampleIntervalDescription: String {
+        "\(Int(settings.effectiveSampleInterval.rounded())) 秒"
+    }
+
     var awaySamplesDescription: String {
         "\(settings.effectiveAwaySampleCount) 次连续低于门限"
     }
@@ -76,6 +86,7 @@ final class AppModel: ObservableObject {
 
     func refreshDevices() {
         discoveredDevices = provider.loadDiscoveredDevices()
+        provider.refreshDiscovery()
     }
 
     func selectDevice(identifier: String?) {
@@ -117,6 +128,14 @@ final class AppModel: ObservableObject {
         }
     }
 
+    func setSampleInterval(_ value: Double) {
+        settings.sampleInterval = min(AppSettings.maximumSampleInterval, max(AppSettings.minimumSampleInterval, value))
+        resetMonitoringState(message: "扫描间隔已更新。")
+        if settings.isMonitoringEnabled {
+            startMonitoring()
+        }
+    }
+
     func setLockAction(_ action: LockAction) {
         settings.lockAction = action
     }
@@ -146,29 +165,24 @@ final class AppModel: ObservableObject {
     }
 
     private func startMonitoring() {
-        timer?.invalidate()
+        samplingMode = .normal
+        invalidateTimer()
 
         guard settings.selectedDeviceIdentifier != nil else {
             statusMessage = "先选择一个蓝牙设备，然后再开启监控。"
             return
         }
 
-        provider.startScanning()
         provider.setMonitoredDevice(identifier: settings.selectedDeviceIdentifier)
+        provider.startMonitoring()
         statusMessage = "监控中，按照设定的采样周期读取蓝牙信号。"
         sampleSelectedDevice(triggerReason: .timer)
-
-        timer = Timer.scheduledTimer(withTimeInterval: settings.sampleInterval, repeats: true) { [weak self] _ in
-            Task { @MainActor [weak self] in
-                self?.sampleSelectedDevice(triggerReason: .timer)
-            }
-        }
     }
 
     private func stopMonitoring(message: String) {
-        timer?.invalidate()
-        timer = nil
-        provider.stopScanning()
+        samplingMode = .normal
+        invalidateTimer()
+        provider.stopMonitoring()
         resetMonitoringState(message: message)
     }
 
@@ -190,7 +204,7 @@ final class AppModel: ObservableObject {
         provider.requestRSSIUpdate()
         refreshDevices()
 
-        let freshnessInterval = max(15, settings.sampleInterval * 3)
+        let freshnessInterval = max(AppSettings.minimumSampleInterval, settings.effectiveSampleInterval * 3)
         let sample = provider.sampleDevice(identifier: identifier, freshnessInterval: freshnessInterval)
         let rssi = sample?.rssi
 
@@ -230,6 +244,8 @@ final class AppModel: ObservableObject {
         if triggerReason == .wake, decision.state == .near, settings.lockAction == .screenSaver {
             actionRunner.dismissScreenSaverIfPossible()
         }
+
+        updateSamplingMode(for: decision)
     }
 
     private func handleAvailabilityChange(_ availability: BluetoothAvailability) {
@@ -240,11 +256,12 @@ final class AppModel: ObservableObject {
             return
         }
 
-        provider.startScanning()
-        provider.setMonitoredDevice(identifier: settings.selectedDeviceIdentifier)
-        refreshDevices()
         if settings.isMonitoringEnabled {
+            provider.setMonitoredDevice(identifier: settings.selectedDeviceIdentifier)
+            provider.startMonitoring()
             sampleSelectedDevice(triggerReason: .timer)
+        } else {
+            refreshDevices()
         }
     }
 
@@ -310,6 +327,57 @@ final class AppModel: ObservableObject {
             sampleSelectedDevice(triggerReason: .wake)
         }
     }
+
+    private func updateSamplingMode(for decision: ProximityDecision) {
+        guard settings.isMonitoringEnabled else {
+            invalidateTimer()
+            return
+        }
+
+        let needsFastConfirmation =
+            evaluator.hasSeenNearby &&
+            decision.state == .unknown &&
+            evaluator.consecutiveAwaySamples > 0 &&
+            evaluator.consecutiveAwaySamples < settings.effectiveAwaySampleCount
+
+        let newMode: SamplingMode = needsFastConfirmation ? .fastConfirmation : .normal
+        scheduleTimer(for: newMode)
+    }
+
+    private func scheduleTimer(for mode: SamplingMode) {
+        let interval = interval(for: mode)
+
+        if samplingMode == mode,
+           let timer,
+           timer.isValid,
+           abs(timer.timeInterval - interval) < 0.001 {
+            return
+        }
+
+        samplingMode = mode
+        invalidateTimer()
+
+        timer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.sampleSelectedDevice(triggerReason: .timer)
+            }
+        }
+        timer?.tolerance = max(1, interval * 0.25)
+    }
+
+    private func invalidateTimer() {
+        timer?.invalidate()
+        timer = nil
+    }
+
+    private func interval(for mode: SamplingMode) -> TimeInterval {
+        switch mode {
+        case .normal:
+            return settings.effectiveSampleInterval
+        case .fastConfirmation:
+            return 5
+        }
+    }
 }
 
 private extension AppModel {
@@ -317,5 +385,10 @@ private extension AppModel {
         case timer
         case manual
         case wake
+    }
+
+    enum SamplingMode {
+        case normal
+        case fastConfirmation
     }
 }
