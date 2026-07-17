@@ -23,6 +23,8 @@ final class BluetoothDeviceProvider: NSObject {
     private var monitoredPeripheral: CBPeripheral?
     private var scanMode: ScanMode = .idle
     private var discoveryStopWorkItem: DispatchWorkItem?
+    private var reconnectWorkItem: DispatchWorkItem?
+    private var nextReconnectAllowedAt: Date = .distantPast
 
     override init() {
         super.init()
@@ -130,6 +132,8 @@ final class BluetoothDeviceProvider: NSObject {
             monitoredPeripheral = peripheral
         }
 
+        cancelPendingReconnect()
+        nextReconnectAllowedAt = .distantPast
         connectMonitoredIfNeeded()
     }
 
@@ -170,6 +174,7 @@ final class BluetoothDeviceProvider: NSObject {
 
     func stopMonitoring() {
         stopScanning()
+        cancelPendingReconnect()
         if let peripheral = monitoredPeripheral, peripheral.state != .disconnected {
             central.cancelPeripheralConnection(peripheral)
         }
@@ -229,15 +234,44 @@ final class BluetoothDeviceProvider: NSObject {
         }
         switch peripheral.state {
         case .connected:
+            cancelPendingReconnect()
             stopScanning()
             peripheral.readRSSI()
         case .connecting:
             break
         default:
+            guard Date() >= nextReconnectAllowedAt else {
+                scheduleReconnectIfNeeded(after: nextReconnectAllowedAt.timeIntervalSinceNow)
+                return
+            }
             ensureMonitoringScanActive()
             log("尝试连接被监控设备 \(peripheral.identifier.uuidString.prefix(8))…")
             central.connect(peripheral, options: nil)
+            nextReconnectAllowedAt = Date().addingTimeInterval(Self.reconnectBackoff)
         }
+    }
+
+    private func scheduleReconnectIfNeeded(after delay: TimeInterval? = nil) {
+        guard monitoredIdentifier != nil else {
+            return
+        }
+        if let reconnectWorkItem, reconnectWorkItem.isCancelled == false {
+            return
+        }
+
+        let effectiveDelay = delay ?? Self.reconnectBackoff
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.reconnectWorkItem = nil
+            self.connectMonitoredIfNeeded()
+        }
+        reconnectWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + max(0.5, effectiveDelay), execute: workItem)
+    }
+
+    private func cancelPendingReconnect() {
+        reconnectWorkItem?.cancel()
+        reconnectWorkItem = nil
     }
 
     private func updateAvailability(_ newValue: BluetoothAvailability) {
@@ -380,6 +414,7 @@ extension BluetoothDeviceProvider: CBCentralManagerDelegate {
                 if monitoredPeripheral == nil {
                     monitoredPeripheral = peripheral
                 }
+                cancelPendingReconnect()
                 connectMonitoredIfNeeded()
             }
         }
@@ -392,6 +427,8 @@ extension BluetoothDeviceProvider: CBCentralManagerDelegate {
             let peripheral = box.value
             log("已连接 \(shortID)，开始读取 RSSI")
             peripheral.delegate = self
+            cancelPendingReconnect()
+            nextReconnectAllowedAt = .distantPast
             stopScanning()
             peripheral.readRSSI()
         }
@@ -406,6 +443,7 @@ extension BluetoothDeviceProvider: CBCentralManagerDelegate {
         let reason = error?.localizedDescription ?? "未知错误"
         MainActor.assumeIsolated {
             log("连接失败 \(shortID)：\(reason)")
+            scheduleReconnectIfNeeded()
         }
     }
 
@@ -422,10 +460,14 @@ extension BluetoothDeviceProvider: CBCentralManagerDelegate {
             if identifier == monitoredIdentifier {
                 // 设备走远或休眠会导致断开，尝试重新连接以便它回到附近时继续读 RSSI。
                 ensureMonitoringScanActive()
-                connectMonitoredIfNeeded()
+                scheduleReconnectIfNeeded()
             }
         }
     }
+}
+
+private extension BluetoothDeviceProvider {
+    static let reconnectBackoff: TimeInterval = 5
 }
 
 extension BluetoothDeviceProvider: CBPeripheralDelegate {
